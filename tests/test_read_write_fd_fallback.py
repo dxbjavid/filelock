@@ -18,6 +18,8 @@ pytest.importorskip("sqlite3")
 import sqlite3
 
 from filelock import AsyncReadWriteLock, ReadWriteLock
+from filelock._identity import host_name
+from filelock._read_write import _LINK_PREFIX, _host_digest, _owner_is_gone
 from tests.capability_marks import NEEDS_FILE_PERMISSIONS
 from tests.read_write_helpers import assert_read_write_lock_state
 
@@ -180,6 +182,35 @@ def test_missing_descriptor_path_keeps_a_directory_it_did_not_name(database: Pat
     with ReadWriteLock(database, is_singleton=False).read_lock():
         pass
     assert foreign.is_dir()
+
+
+_SELF_DIGEST: Final = _host_digest(host_name())
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        pytest.param(f"{_LINK_PREFIX}²-1-{_SELF_DIGEST}-x", id="non-ascii-pid"),
+        pytest.param(f"{_LINK_PREFIX}{'9' * 20}-1-{_SELF_DIGEST}-x", id="oversized-pid"),
+        pytest.param(f"{_LINK_PREFIX}0-1-{_SELF_DIGEST}-x", id="zero-pid"),
+        pytest.param(f"{_LINK_PREFIX}123-²-{_SELF_DIGEST}-x", id="non-ascii-start"),
+        pytest.param(f"{_LINK_PREFIX}123--deadbeefdeadbeef-x", id="empty-start-foreign"),
+    ],
+)
+def test_owner_is_gone_refuses_a_hostile_owner_name(name: str) -> None:
+    # Each of these crashed before the fix: a non-ASCII digit passes str.isdigit() but raises ValueError in int(), and
+    # an out-of-range pid overflows a C int in os.kill. A hostile name must read as a live owner the sweep leaves alone.
+    assert _owner_is_gone(name) is False
+
+
+def test_missing_descriptor_path_survives_a_hostile_link_name(database: Path) -> None:
+    # A same-UID peer plants a link directory whose owner field is a non-ASCII digit int() cannot parse. The sweep that
+    # runs on the hard-link connect path must skip it, not raise the ValueError out of acquire.
+    hostile: Final = database.parent / f"{_LINK_PREFIX}²-1-{_SELF_DIGEST}-x"
+    hostile.mkdir()
+    with ReadWriteLock(database, is_singleton=False).read_lock():
+        assert_read_write_lock_state(str(database), "write", available=False)
+    assert hostile.is_dir()
 
 
 @NEEDS_FILE_PERMISSIONS  # pragma: needs file-permissions
